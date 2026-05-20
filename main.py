@@ -2,6 +2,7 @@ import os
 import sqlite3
 import asyncio
 import logging
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -16,9 +17,10 @@ CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@echoesapp")
 DB_PATH = os.getenv("DB_PATH", "capsules.db")
 DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "Europe/Moscow")
 
-WELCOME_IMAGE = "welcome.png"
-SUCCESS_IMAGE = "success.png"
-DELIVERY_IMAGE = "delivery.png"
+BASE_DIR = Path(__file__).resolve().parent
+WELCOME_IMAGE = BASE_DIR / "welcome.png"
+SUCCESS_IMAGE = BASE_DIR / "success.png"
+DELIVERY_IMAGE = BASE_DIR / "delivery.png"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -65,8 +67,11 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def image_exists(path: str) -> bool:
-    return os.path.exists(path)
+def image_exists(path: Path) -> bool:
+    exists = path.exists() and path.is_file()
+    if not exists:
+        logging.warning("Image not found: %s", path)
+    return exists
 
 
 def format_dt(iso_dt: str) -> str:
@@ -153,9 +158,9 @@ def delay_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-async def reply_with_png(message, text: str, image_path: str, reply_markup=None) -> None:
+async def reply_with_png(message, text: str, image_path: Path, reply_markup=None) -> None:
     if image_exists(image_path):
-        with open(image_path, "rb") as image:
+        with image_path.open("rb") as image:
             await message.reply_photo(photo=image, caption=text, reply_markup=reply_markup)
     else:
         await message.reply_text(text, reply_markup=reply_markup)
@@ -167,7 +172,7 @@ async def send_success_with_png(query, text: str, reply_markup=None) -> None:
             await query.delete_message()
         except Exception:
             pass
-        with open(SUCCESS_IMAGE, "rb") as image:
+        with SUCCESS_IMAGE.open("rb") as image:
             await query.message.chat.send_photo(photo=image, caption=text, reply_markup=reply_markup)
     else:
         await query.edit_message_text(text, reply_markup=reply_markup)
@@ -176,7 +181,7 @@ async def send_success_with_png(query, text: str, reply_markup=None) -> None:
 async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     base_text = (
-        "Привет 🤍\\n\\n"
+        "Привет 🤍\n\n"
         "Это маленькая капсула времени для важных воспоминаний. "
         "Оставь здесь мысль, момент, фото или сообщение, которое не хочешь потерять — "
         "и я бережно верну его тебе позже ✨"
@@ -185,7 +190,7 @@ async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await is_subscribed(context, user_id):
         await reply_with_png(
             update.effective_message,
-            base_text + "\\n\\nЧтобы пользоваться ботом, подпишись на канал ēchoēs.",
+            base_text + "\n\nЧтобы пользоваться ботом, подпишись на канал ēchoēs.",
             WELCOME_IMAGE,
             subscribe_keyboard(),
         )
@@ -206,12 +211,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "check_subscription":
         if await is_subscribed(context, user_id):
             await query.edit_message_text(
-                "Спасибо, подписка есть 🤍\\n\\nТеперь можно создать капсулу времени.",
+                "Спасибо, подписка есть 🤍\n\nТеперь можно создать капсулу времени.",
                 reply_markup=start_keyboard(),
             )
         else:
             await query.edit_message_text(
-                "Похоже, подписки пока нет 🥲\\n\\nПодпишись на канал, а потом нажми кнопку проверки ещё раз.",
+                "Похоже, подписки пока нет 🥲\n\nПодпишись на канал, а потом нажми кнопку проверки ещё раз.",
                 reply_markup=subscribe_keyboard(),
             )
         return
@@ -223,7 +228,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if query.data == "create_capsule":
         set_state(user_id, STATE_WAITING_MEMORY)
         await query.edit_message_text(
-            "Что хочешь сохранить? 💌\\n\\n"
+            "Что хочешь сохранить? 💌\n\n"
             "Это может быть текст, фото, фото с подписью, маленькое послание себе "
             "или что-то, что не хочется потерять."
         )
@@ -241,7 +246,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         _, memory_text, photo_file_id = get_state(user_id)
 
         if not memory_text and not photo_file_id:
-            await query.edit_message_text("Я не нашла содержимое капсулы 🥲\\n\\nДавай создадим её заново.", reply_markup=start_keyboard())
+            await query.edit_message_text("Я не нашла содержимое капсулы 🥲\n\nДавай создадим её заново.", reply_markup=start_keyboard())
             set_state(user_id, None)
             return
 
@@ -258,7 +263,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         await send_success_with_png(
             query,
-            f"Готово ✨\\n\\nЯ бережно сохраню это и верну тебе {readable} 💌",
+            f"Готово ✨\n\nЯ бережно сохраню это и верну тебе {readable} 💌",
             InlineKeyboardMarkup([[InlineKeyboardButton("Создать ещё одну капсулу", callback_data="create_capsule")]]),
         )
 
@@ -283,11 +288,11 @@ async def handle_text_or_photo(update: Update, context: ContextTypes.DEFAULT_TYP
             memory_text = update.message.text.strip()
 
         if not memory_text and not photo_file_id:
-            await update.message.reply_text("Кажется, я не смогл сохранить это 🥲 Попробуй отправить текст или фото.")
+            await update.message.reply_text("Кажется, я не смогла сохранить это 🥲 Попробуй отправить текст или фото.")
             return
 
         set_state(user_id, STATE_WAITING_MEMORY, memory_text, photo_file_id)
-        await update.message.reply_text("Воспоминание сохранено\\n\\nТеперь выбери, когда вернуть это тебе.", reply_markup=delay_keyboard())
+        await update.message.reply_text("Воспоминание сохранено\n\nТеперь выбери, когда вернуть это тебе.", reply_markup=delay_keyboard())
         return
 
     await update.message.reply_text("Я могу сохранить для тебя капсулу времени 💌", reply_markup=start_keyboard())
@@ -298,24 +303,22 @@ async def send_capsule(app: Application, user_id: int, memory_text: str, photo_f
 
     if memory_text:
         caption = (
-            "Твоя капсула времени 💌\\n\\n"
-            f"Ты сохранил(а) это {saved_date}:\\n\\n"
-            f"“{memory_text}”\\n\\n"
+            "Твоя капсула времени 💌\n\n"
+            f"Ты сохранил(а) это {saved_date}:\n\n"
+            f"“{memory_text}”\n\n"
             "Иногда важные вещи просто стоит услышать снова"
         )
     else:
         caption = (
-            "Твоя капсула времени 💌\\n\\n"
-            f"Ты сохранил(а) это {saved_date}.\\n\\n"
+            "Твоя капсула времени 💌\n\n"
+            f"Ты сохранил(а) это {saved_date}.\n\n"
             "Иногда важные вещи просто стоит увидеть снова"
         )
 
-    # If user saved their own photo, return that photo with the capsule text.
-    # If capsule is text-only, send branded delivery.png with the capsule text.
     if photo_file_id:
         await app.bot.send_photo(chat_id=user_id, photo=photo_file_id, caption=caption)
     elif image_exists(DELIVERY_IMAGE):
-        with open(DELIVERY_IMAGE, "rb") as image:
+        with DELIVERY_IMAGE.open("rb") as image:
             await app.bot.send_photo(chat_id=user_id, photo=image, caption=caption)
     else:
         await app.bot.send_message(chat_id=user_id, text=caption)
@@ -352,3 +355,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
