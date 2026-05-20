@@ -13,4 +13,4 @@ Start command: python main.py
 BOT_TOKEN — token from @BotFather  
 CHANNEL_USERNAME — @echoesapp
 
-updated
+redeploy trigger
