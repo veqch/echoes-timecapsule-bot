@@ -19,16 +19,25 @@ from telegram.ext import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@echoesapp")
-DB_PATH = os.getenv("DB_PATH", "capsules.db")
 DISPLAY_TIMEZONE = os.getenv("DISPLAY_TIMEZONE", "Europe/Moscow")
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# SQLite on Railway is safe only if it is stored on a mounted Volume.
+# If you add a Railway Volume mounted to /data, the bot will use /data/capsules.db automatically.
+DB_PATH = os.getenv("DB_PATH")
+if not DB_PATH:
+    railway_volume = Path("/data")
+    DB_PATH = str(railway_volume / "capsules.db") if railway_volume.exists() else str(BASE_DIR / "capsules.db")
 
 WELCOME_IMAGE = BASE_DIR / "welcome.png"
 SUCCESS_IMAGE = BASE_DIR / "success.png"
 DELIVERY_IMAGE = BASE_DIR / "delivery.png"
 
 STATE_WAITING_MEMORY = "waiting_memory"
+
+MEDIA_GROUP_BUFFERS: dict[str, dict] = {}
+MEDIA_GROUP_DELAY_SECONDS = 1.4
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,6 +62,16 @@ def image_exists(path: Path) -> bool:
     return exists
 
 
+def connect_db() -> sqlite3.Connection:
+    db_path = Path(DB_PATH)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    conn = sqlite3.connect(str(db_path), timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    return conn
+
+
 def encode_photo_ids(photo_ids: list[str] | None) -> str:
     return json.dumps(photo_ids or [], ensure_ascii=False)
 
@@ -70,7 +89,7 @@ def decode_photo_ids(value: str | None) -> list[str]:
 
 
 def init_db() -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS capsules (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -109,7 +128,7 @@ def init_db() -> None:
 
 
 def set_state(user_id: int, state: str | None, memory_text: str | None = None, photo_file_ids: list[str] | None = None) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         if state is None:
             conn.execute("DELETE FROM user_states WHERE user_id = ?", (user_id,))
             return
@@ -126,7 +145,7 @@ def set_state(user_id: int, state: str | None, memory_text: str | None = None, p
 
 
 def get_state(user_id: int):
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         row = conn.execute(
             """
             SELECT state, memory_text, photo_file_id, photo_file_ids
@@ -171,7 +190,7 @@ def save_capsule(user_id: int, username: str | None, memory_text: str | None, ph
     photo_ids = photo_file_ids or []
     first_photo = photo_ids[0] if photo_ids else None
 
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.execute("""
             INSERT INTO capsules (
                 user_id, username, memory_text, photo_file_id, photo_file_ids,
@@ -190,7 +209,7 @@ def save_capsule(user_id: int, username: str | None, memory_text: str | None, ph
 
 
 def get_due_capsules():
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         return conn.execute("""
             SELECT id, user_id, memory_text, photo_file_id, photo_file_ids, created_at
             FROM capsules
@@ -200,7 +219,7 @@ def get_due_capsules():
 
 
 def mark_sent(capsule_id: int) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
+    with connect_db() as conn:
         conn.execute("UPDATE capsules SET is_sent = 1 WHERE id = ?", (capsule_id,))
 
 
@@ -377,6 +396,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+def capsule_status_text(memory_text: str, photo_ids: list[str]) -> str:
+    count_text = []
+
+    if memory_text:
+        count_text.append("текст")
+    if photo_ids:
+        count_text.append(f"{len(photo_ids)} фото")
+
+    saved_part = " + ".join(count_text) if count_text else "воспоминание"
+
+    return (
+        f"Сохранила: {saved_part} 🤍\n\n"
+        "Можешь отправить ещё текст или фото. "
+        "Когда закончишь, нажми «Выбрать время»."
+    )
+
+
+async def flush_media_group(context: ContextTypes.DEFAULT_TYPE, media_group_key: str) -> None:
+    await asyncio.sleep(MEDIA_GROUP_DELAY_SECONDS)
+
+    buffer = MEDIA_GROUP_BUFFERS.pop(media_group_key, None)
+    if not buffer:
+        return
+
+    user_id = buffer["user_id"]
+    message = buffer["message"]
+
+    _, memory_text, photo_ids = get_state(user_id)
+
+    await message.reply_text(
+        capsule_status_text(memory_text, photo_ids),
+        reply_markup=content_keyboard(),
+    )
+
 async def handle_text_or_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
 
@@ -396,34 +449,61 @@ async def handle_text_or_photo(update: Update, context: ContextTypes.DEFAULT_TYP
         )
         return
 
-    new_text = None
-    new_photo_id = None
-
     if update.message.photo:
         new_photo_id = update.message.photo[-1].file_id
         new_text = update.message.caption.strip() if update.message.caption else None
-    elif update.message.text:
-        new_text = update.message.text.strip()
 
-    if not new_text and not new_photo_id:
-        await update.message.reply_text("Кажется, я не смогла сохранить это 🥲 Попробуй отправить текст или фото.")
+        update_memory_state(
+            user_id=user_id,
+            new_text=new_text,
+            new_photo_id=new_photo_id,
+        )
+
+        media_group_id = update.message.media_group_id
+
+        if media_group_id:
+            media_group_key = f"{user_id}:{media_group_id}"
+
+            if media_group_key not in MEDIA_GROUP_BUFFERS:
+                MEDIA_GROUP_BUFFERS[media_group_key] = {
+                    "user_id": user_id,
+                    "message": update.message,
+                }
+                context.application.create_task(
+                    flush_media_group(context, media_group_key)
+                )
+
+            return
+
+        _, memory_text, photo_ids = get_state(user_id)
+        await update.message.reply_text(
+            capsule_status_text(memory_text, photo_ids),
+            reply_markup=content_keyboard(),
+        )
         return
 
-    memory_text, photo_ids = update_memory_state(user_id=user_id, new_text=new_text, new_photo_id=new_photo_id)
+    if update.message.text:
+        new_text = update.message.text.strip()
 
-    count_text = []
-    if memory_text:
-        count_text.append("текст")
-    if photo_ids:
-        count_text.append(f"{len(photo_ids)} фото")
+        if not new_text:
+            await update.message.reply_text(
+                "Кажется, я не смогла сохранить это 🥲 Попробуй отправить текст или фото."
+            )
+            return
 
-    saved_part = " + ".join(count_text) if count_text else "воспоминание"
+        memory_text, photo_ids = update_memory_state(
+            user_id=user_id,
+            new_text=new_text,
+        )
+
+        await update.message.reply_text(
+            capsule_status_text(memory_text, photo_ids),
+            reply_markup=content_keyboard(),
+        )
+        return
 
     await update.message.reply_text(
-        f"Сохранила: {saved_part} 🤍\n\n"
-        "Можешь отправить ещё текст или фото. "
-        "Когда закончишь, нажми «Выбрать время».",
-        reply_markup=content_keyboard(),
+        "Кажется, я не смогла сохранить это 🥲 Попробуй отправить текст или фото."
     )
 
 
@@ -485,7 +565,7 @@ async def capsule_sender(app: Application) -> None:
 
 
 async def post_init(app: Application) -> None:
-    app.create_task(capsule_sender(app))
+    asyncio.create_task(capsule_sender(app))
 
 
 def main() -> None:
