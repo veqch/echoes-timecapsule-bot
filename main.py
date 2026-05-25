@@ -310,7 +310,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     if query.data == "create_capsule":
         set_state(user_id, STATE_WAITING_MEMORY, "", [])
-        await query.edit_message_text(
+
+        await query.message.reply_text(
             "Что хочешь сохранить? 💌\n\n"
             "Отправь текст, одно фото или несколько фото. "
             "Можно отправить фото с подписью — я сохраню всё в одну капсулу.\n\n"
